@@ -1,0 +1,19 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Pixclear Upload Test</title>
+</head>
+<body>
+  <h2>Pixclear File Picker Test</h2>
+
+  <input
+    type="file"
+    accept="image/*"
+    onchange="document.getElementById('result').textContent = this.files[0]?.name || 'No file selected'"
+  />
+
+  <p id="result">No file selected</p>
+</body>
+</html>

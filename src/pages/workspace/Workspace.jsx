@@ -191,7 +191,7 @@ const Workspace = () => {
         { type: 'image/png' }
       )
 
-      const result = await saveProject({
+     const result = await saveProject({
         originalImage: file,
         processedImage: processedFile,
         name: file.name.replace(/\.[^/.]+$/, ''),

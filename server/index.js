@@ -5,11 +5,13 @@ import express from 'express'
 import mongoose from 'mongoose'
 import cors from 'cors'
 import helmet from 'helmet'
-import multer from 'multer'
 import rateLimit from 'express-rate-limit'
 import cookieParser from 'cookie-parser'
+import { randomUUID } from 'node:crypto'
 
 import connectDB from './config/db.js'
+import cloudinary from './config/cloudinary.js'
+
 import authRoutes from './routes/authRoutes.js'
 import projectRoutes from './routes/projectRoutes.js'
 import protect from './middleware/authMiddleware.js'
@@ -17,7 +19,7 @@ import protect from './middleware/authMiddleware.js'
 const app = express()
 const PORT = process.env.PORT || 5000
 
-// Trust Render's reverse proxy.
+// Trust the Vercel reverse proxy.
 app.set('trust proxy', 1)
 
 // Allowed frontend origins.
@@ -39,7 +41,6 @@ app.use(helmet())
 app.use(
   cors({
     origin(origin, callback) {
-      // Allow requests without an Origin header, such as server-to-server requests.
       if (!origin) {
         return callback(null, true)
       }
@@ -76,37 +77,25 @@ const limiter = rateLimit({
 
 app.use('/api/', limiter)
 
-// Image upload configuration.
-const upload = multer({
-  storage: multer.memoryStorage(),
+// Ensure MongoDB is connected before handling API requests.
+// The connection helper caches the connection for serverless use.
+app.use('/api', async (req, res, next) => {
+  try {
+    await connectDB()
+    next()
+  } catch (error) {
+    console.error('Database connection error:', error.message)
 
-  limits: {
-    fileSize: 22 * 1024 * 1024,
-    files: 1,
-  },
-
-  fileFilter(req, file, callback) {
-    const acceptedTypes = [
-      'image/png',
-      'image/jpeg',
-      'image/webp',
-    ]
-
-    if (!acceptedTypes.includes(file.mimetype)) {
-      return callback(
-        new Error(
-          'Please upload a PNG, JPG, JPEG or WebP image.'
-        )
-      )
-    }
-
-    callback(null, true)
-  },
+    return res.status(503).json({
+      success: false,
+      message: 'Database is temporarily unavailable. Please try again.',
+    })
+  }
 })
 
 // Root health check.
 app.get('/', (req, res) => {
-  res.json({
+  return res.status(200).json({
     success: true,
     message: 'Pixclear API is running!',
   })
@@ -114,7 +103,8 @@ app.get('/', (req, res) => {
 
 // API health check.
 app.get('/api/health', (req, res) => {
-  const databaseConnected = mongoose.connection.readyState === 1
+  const databaseConnected =
+    mongoose.connection.readyState === 1
 
   return res.status(databaseConnected ? 200 : 503).json({
     success: databaseConnected,
@@ -131,11 +121,100 @@ app.use('/api/auth', authRoutes)
 // Project management routes.
 app.use('/api/projects', projectRoutes)
 
+// Check that the supplied image URL belongs to the
+// authenticated user's Cloudinary folder.
+const validateCloudinaryImageUrl = (imageUrl, userId) => {
+  if (
+    typeof imageUrl !== 'string' ||
+    imageUrl.length > 2048
+  ) {
+    return false
+  }
+
+  try {
+    const imageUrlObject = new URL(imageUrl)
+
+    if (
+      imageUrlObject.protocol !== 'https:' ||
+      imageUrlObject.hostname !== 'res.cloudinary.com'
+    ) {
+      return false
+    }
+
+    const cloudName = process.env.CLOUDINARY_CLOUD_NAME
+
+    if (!cloudName) {
+      throw new Error('Cloudinary cloud name is not configured.')
+    }
+
+    const expectedPrefix = `/${cloudName}/image/upload/`
+
+    if (!imageUrlObject.pathname.startsWith(expectedPrefix)) {
+      return false
+    }
+
+    let assetPath = imageUrlObject.pathname.slice(
+      expectedPrefix.length
+    )
+
+    // Remove Cloudinary's version segment, if present.
+    assetPath = assetPath.replace(/^v\d+\//, '')
+
+    assetPath = decodeURIComponent(assetPath)
+
+    const expectedUserFolder = `pixclear/users/${userId}/`
+
+    return assetPath.startsWith(expectedUserFolder)
+  } catch (error) {
+    if (error.message === 'Cloudinary cloud name is not configured.') {
+      throw error
+    }
+
+    return false
+  }
+}
+
+// Upload a processed image buffer to Cloudinary.
+const uploadProcessedImage = (buffer, userId) => {
+  return new Promise((resolve, reject) => {
+    if (!Buffer.isBuffer(buffer) || buffer.length === 0) {
+      return reject(
+        new Error('Invalid processed image buffer.')
+      )
+    }
+
+    const uploadStream = cloudinary.uploader.upload_stream(
+      {
+        folder: `pixclear/users/${userId}`,
+        public_id: `processed-${randomUUID()}`,
+        resource_type: 'image',
+        format: 'png',
+        overwrite: false,
+      },
+      (error, result) => {
+        if (error) {
+          return reject(error)
+        }
+
+        if (!result?.secure_url || !result?.public_id) {
+          return reject(
+            new Error('Cloudinary returned incomplete image information.')
+          )
+        }
+
+        resolve(result)
+      }
+    )
+
+    uploadStream.on('error', reject)
+    uploadStream.end(buffer)
+  })
+}
+
 // Background removal.
 app.post(
   '/api/remove-background',
   protect,
-  upload.single('image'),
   async (req, res) => {
     try {
       if (!process.env.REMOVE_BG_API_KEY) {
@@ -145,23 +224,52 @@ app.post(
         })
       }
 
-      if (!req.file) {
-        return res.status(400).json({
+      if (
+        !process.env.CLOUDINARY_CLOUD_NAME ||
+        !process.env.CLOUDINARY_API_KEY ||
+        !process.env.CLOUDINARY_API_SECRET
+      ) {
+        return res.status(500).json({
           success: false,
-          message: 'Please upload an image.',
+          message: 'Cloudinary is not properly configured.',
         })
       }
 
-      const formData = new FormData()
+      const userId = req.userId
 
-      formData.append(
-        'image_file',
-        new Blob([req.file.buffer], {
-          type: req.file.mimetype,
-        }),
-        req.file.originalname || 'upload'
+      if (!userId) {
+        return res.status(401).json({
+          success: false,
+          message: 'Authentication required. Please log in again.',
+        })
+      }
+
+      const { imageUrl } = req.body || {}
+
+      if (!imageUrl) {
+        return res.status(400).json({
+          success: false,
+          message: 'An image URL is required.',
+        })
+      }
+
+      // Prevent arbitrary external URLs from being processed.
+      const validImageUrl = validateCloudinaryImageUrl(
+        imageUrl,
+        userId
       )
 
+      if (!validImageUrl) {
+        return res.status(400).json({
+          success: false,
+          message: 'The supplied image URL is invalid.',
+        })
+      }
+
+      // Prepare remove.bg request.
+      const formData = new FormData()
+
+      formData.append('image_url', imageUrl)
       formData.append('size', 'auto')
 
       const response = await fetch(
@@ -188,10 +296,11 @@ app.post(
         return res.status(502).json({
           success: false,
           message:
-            'Background removal failed. Please check your API key, API credits, or try again.',
+            'Background removal failed. Please check your API credits or try again.',
         })
       }
 
+      // Receive the processed image from remove.bg.
       const imageBuffer = Buffer.from(
         await response.arrayBuffer()
       )
@@ -203,18 +312,27 @@ app.post(
         })
       }
 
-      res.set({
-        'Content-Type': 'image/png',
-        'Content-Disposition':
-          'inline; filename="pixclear-result.png"',
-        'Cache-Control': 'no-store',
+      // Store the processed result directly in Cloudinary.
+      const processedUpload = await uploadProcessedImage(
+        imageBuffer,
+        userId
+      )
+
+      return res.status(200).json({
+        success: true,
+        message: 'Background removed successfully.',
+        imageUrl: processedUpload.secure_url,
       })
-
-      return res.send(imageBuffer)
     } catch (error) {
-      console.error('Background processing error:', error.message)
+      console.error(
+        'Background processing error:',
+        error.message
+      )
 
-      if (error.name === 'TimeoutError' || error.name === 'AbortError') {
+      if (
+        error.name === 'TimeoutError' ||
+        error.name === 'AbortError'
+      ) {
         return res.status(504).json({
           success: false,
           message: 'Image processing timed out. Please try again.',
@@ -249,24 +367,7 @@ app.use((error, req, res, next) => {
   let statusCode = 500
   let message = 'Something went wrong on the server.'
 
-  if (error instanceof multer.MulterError) {
-    statusCode = 400
-
-    if (error.code === 'LIMIT_FILE_SIZE') {
-      message = 'Image size must not exceed 22MB.'
-    } else if (error.code === 'LIMIT_FILE_COUNT') {
-      message = 'Only one image can be uploaded at a time.'
-    } else {
-      message = error.message
-    }
-  } else if (
-    error.message?.startsWith('Please upload')
-  ) {
-    statusCode = 400
-    message = error.message
-  } else if (
-    error.message?.startsWith('Origin not allowed by CORS:')
-  ) {
+  if (error.message?.startsWith('Origin not allowed by CORS:')) {
     statusCode = 403
     message = 'This origin is not allowed to access the API.'
   }
@@ -277,23 +378,13 @@ app.use((error, req, res, next) => {
   })
 })
 
-// Start server only after successful database connection.
-const startServer = async () => {
-  try {
-    await connectDB()
+// Export Express app for Vercel serverless deployment.
+export default app
 
-    app.listen(PORT, '0.0.0.0', () => {
-      console.log(`Pixclear server running on port ${PORT}`)
-      console.log('MongoDB connection established.')
-    })
-  } catch (error) {
-    console.error(
-      'Unable to start Pixclear:',
-      error.message
-    )
-
-    process.exit(1)
-  }
+// Start a normal HTTP server during local development.
+// Vercel handles the serverless listener itself.
+if (!process.env.VERCEL) {
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Pixclear server running on port ${PORT}`)
+  })
 }
-
-startServer()

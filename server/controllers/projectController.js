@@ -5,21 +5,13 @@ import Project from '../models/Project.js'
 import cloudinary from '../config/cloudinary.js'
 
 // Get the authenticated user's ID.
-// Supports common authentication middleware formats.
 const getAuthenticatedUserId = (req) => {
-  if (req.userId) {
-    return req.userId
-  }
-
-  if (typeof req.user === 'string') {
-    return req.user
-  }
-
   return (
+    req.userId ||
     req.user?._id ||
     req.user?.id ||
     req.user?.userId ||
-    null
+    (typeof req.user === 'string' ? req.user : null)
   )
 }
 
@@ -33,7 +25,6 @@ const getCurrentMonthRange = () => {
       now.getMonth(),
       1
     ),
-
     nextMonth: new Date(
       now.getFullYear(),
       now.getMonth() + 1,
@@ -63,7 +54,6 @@ const getMonthlyProjectCount = async (userId) => {
 
   return Project.countDocuments({
     user: userId,
-
     createdAt: {
       $gte: monthStart,
       $lt: nextMonth,
@@ -71,42 +61,88 @@ const getMonthlyProjectCount = async (userId) => {
   })
 }
 
-// Upload an image buffer to Cloudinary.
-const uploadToCloudinary = (buffer) => {
-  return new Promise((resolve, reject) => {
-    if (!buffer || !Buffer.isBuffer(buffer)) {
-      return reject(
-        new Error('Invalid image buffer.')
-      )
+// Verify that an image came from Cloudinary
+// and belongs to the authenticated user's folder.
+const verifyCloudinaryImage = (image, userId) => {
+  if (!image || typeof image !== 'object') {
+    return false
+  }
+
+  const {
+    secure_url,
+    public_id,
+    version,
+    signature,
+  } = image
+
+  if (
+    typeof secure_url !== 'string' ||
+    typeof public_id !== 'string' ||
+    !public_id.trim() ||
+    !version ||
+    !signature ||
+    typeof signature !== 'string'
+  ) {
+    return false
+  }
+
+  const cloudName = process.env.CLOUDINARY_CLOUD_NAME
+  const apiSecret = process.env.CLOUDINARY_API_SECRET
+
+  if (!cloudName || !apiSecret) {
+    throw new Error(
+      'Cloudinary credentials are not configured.'
+    )
+  }
+
+  // Ensure the image belongs to this user's folder.
+  const expectedFolder = `pixclear/users/${userId}/`
+
+  if (!public_id.startsWith(expectedFolder)) {
+    return false
+  }
+
+  // Ensure the image URL belongs to this Cloudinary account
+  // and corresponds to the supplied public ID and version.
+  try {
+    const imageUrl = new URL(secure_url)
+
+    if (
+      imageUrl.protocol !== 'https:' ||
+      imageUrl.hostname !== 'res.cloudinary.com'
+    ) {
+      return false
     }
 
-    const uploadStream = cloudinary.uploader.upload_stream(
-      {
-        folder: 'pixclear/projects',
-        resource_type: 'image',
-        allowed_formats: ['png', 'jpg', 'jpeg', 'webp'],
-        timeout: 120000,
-      },
+    const expectedPathPrefix =
+      `/${cloudName}/image/upload/v${version}/${public_id}.`
 
-      (error, result) => {
-        if (error) {
-          return reject(error)
-        }
-
-        if (!result) {
-          return reject(
-            new Error('Cloudinary returned no upload result.')
-          )
-        }
-
-        resolve(result)
-      }
+    const decodedPath = decodeURIComponent(
+      imageUrl.pathname
     )
 
-    uploadStream.on('error', reject)
+    if (!decodedPath.startsWith(expectedPathPrefix)) {
+      return false
+    }
+  } catch {
+    return false
+  }
 
-    uploadStream.end(buffer)
-  })
+  // Verify Cloudinary's upload response signature.
+  try {
+    return cloudinary.utils.verify_api_response_signature(
+      public_id,
+      version,
+      signature
+    )
+  } catch (error) {
+    console.error(
+      'Cloudinary signature verification error:',
+      error.message
+    )
+
+    return false
+  }
 }
 
 // Delete an image from Cloudinary.
@@ -114,7 +150,9 @@ const deleteCloudinaryImage = async (publicId) => {
   if (!publicId) return
 
   try {
-    await cloudinary.uploader.destroy(publicId)
+    await cloudinary.uploader.destroy(publicId, {
+      resource_type: 'image',
+    })
   } catch (error) {
     console.error(
       'Cloudinary deletion error:',
@@ -125,55 +163,86 @@ const deleteCloudinaryImage = async (publicId) => {
 
 // SAVE PROJECT
 export const saveProject = async (req, res) => {
-  let originalUpload
-  let processedUpload
+  let originalPublicId
+  let processedPublicId
 
   try {
     const userId = getAuthenticatedUserId(req)
 
-    console.log('PROJECT: Authenticated user ID:', userId)
-
     if (!userId) {
       return res.status(401).json({
         success: false,
-        message: 'Authentication required. Please log in again.',
+        message: 'Authentication required. Please login again.',
       })
     }
 
-    // Verify uploaded files.
-    const originalFile = req.files?.originalImage?.[0]
-    const processedFile = req.files?.processedImage?.[0]
+    if (!mongoose.isValidObjectId(userId)) {
+      return res.status(401).json({
+        success: false,
+        message: 'Your user session is invalid.',
+      })
+    }
 
-    if (!originalFile || !processedFile) {
+    const { originalImage, processedImage } = req.body || {}
+
+    // Check that both images were supplied.
+    if (!originalImage || !processedImage) {
       return res.status(400).json({
         success: false,
         message: 'Both original and processed images are required.',
       })
     }
 
-    // Validate image formats.
-    const validTypes = [
-      'image/png',
-      'image/jpeg',
-      'image/webp',
-    ]
+    // Verify both Cloudinary upload responses.
+    const originalIsValid = verifyCloudinaryImage(
+      originalImage,
+      userId
+    )
 
-    if (
-      !validTypes.includes(originalFile.mimetype) ||
-      !validTypes.includes(processedFile.mimetype)
-    ) {
+    const processedIsValid = verifyCloudinaryImage(
+      processedImage,
+      userId
+    )
+
+    // Only retain public IDs that have passed verification.
+    if (originalIsValid) {
+      originalPublicId = originalImage.public_id
+    }
+
+    if (processedIsValid) {
+      processedPublicId = processedImage.public_id
+    }
+
+    if (!originalIsValid || !processedIsValid) {
+      // Clean up any supplied uploads that were successfully verified.
+      await Promise.all([
+        deleteCloudinaryImage(originalPublicId),
+        deleteCloudinaryImage(processedPublicId),
+      ])
+
+      originalPublicId = null
+      processedPublicId = null
+
       return res.status(400).json({
         success: false,
-        message: 'Unsupported image format.',
+        message: 'One or both image uploads could not be verified.',
       })
     }
 
     // Check monthly project allowance.
     const limit = getMonthlyLimit()
-
     const used = await getMonthlyProjectCount(userId)
 
     if (used >= limit) {
+      // Prevent unused uploads from accumulating in Cloudinary.
+      await Promise.all([
+        deleteCloudinaryImage(originalPublicId),
+        deleteCloudinaryImage(processedPublicId),
+      ])
+
+      originalPublicId = null
+      processedPublicId = null
+
       return res.status(403).json({
         success: false,
         code: 'MONTHLY_LIMIT_REACHED',
@@ -186,97 +255,57 @@ export const saveProject = async (req, res) => {
       })
     }
 
-    console.log(
-      'Original image size:',
-      (originalFile.size / (1024 * 1024)).toFixed(2),
-      'MB'
-    )
-
-    console.log(
-      'Processed image size:',
-      (processedFile.size / (1024 * 1024)).toFixed(2),
-      'MB'
-    )
-
-    // Upload original image.
-    console.log('Uploading original image to Cloudinary...')
-
-    originalUpload = await uploadToCloudinary(
-      originalFile.buffer
-    )
-
-    console.log('Original image uploaded successfully.')
-
-    // Upload processed image.
-    console.log('Uploading processed image to Cloudinary...')
-
-    processedUpload = await uploadToCloudinary(
-      processedFile.buffer
-    )
-
-    console.log('Processed image uploaded successfully.')
-
-    // Verify Cloudinary upload results.
-    if (
-      !originalUpload.secure_url ||
-      !originalUpload.public_id ||
-      !processedUpload.secure_url ||
-      !processedUpload.public_id
-    ) {
-      throw new Error(
-        'Cloudinary image information is incomplete.'
-      )
-    }
+    // Prepare project name.
+    const projectName =
+      typeof req.body.name === 'string'
+        ? req.body.name.trim().slice(0, 150)
+        : ''
 
     // Save project information in MongoDB.
-    console.log('Creating MongoDB project...')
-
     const project = await Project.create({
       user: userId,
 
-      name:
-        req.body.name?.trim().slice(0, 150) ||
-        'Untitled Project',
+      name: projectName || 'Untitled Project',
 
       originalImage: {
-        url: originalUpload.secure_url,
-        publicId: originalUpload.public_id,
+        url: originalImage.secure_url,
+        publicId: originalImage.public_id,
       },
 
       processedImage: {
-        url: processedUpload.secure_url,
-        publicId: processedUpload.public_id,
+        url: processedImage.secure_url,
+        publicId: processedImage.public_id,
       },
 
       processingType: 'background-removal',
       status: 'completed',
     })
 
-    console.log('Project saved successfully.')
+    // MongoDB now owns the project records.
+    // Do not delete their Cloudinary images.
+    originalPublicId = null
+    processedPublicId = null
 
     return res.status(201).json({
       success: true,
       message: 'Project saved successfully.',
       project,
-
       usage: {
         used: used + 1,
         limit,
         remaining: Math.max(0, limit - (used + 1)),
       },
     })
-
   } catch (error) {
     console.error('Save project error:', {
       message: error.message,
       name: error.name,
-      http_code: error.http_code,
     })
 
-    // Clean up uploaded images if project saving fails.
+    // Clean up verified uploads if project saving fails.
     await Promise.all([
-      deleteCloudinaryImage(originalUpload?.public_id),
-      deleteCloudinaryImage(processedUpload?.public_id),
+      deleteCloudinaryImage(originalPublicId),
+      deleteCloudinaryImage(processedPublicId),
     ])
 
     return res.status(500).json({
@@ -309,7 +338,6 @@ export const getProjects = async (req, res) => {
       count: projects.length,
       projects,
     })
-
   } catch (error) {
     console.error('Get projects error:', error)
 
@@ -324,6 +352,7 @@ export const getProjects = async (req, res) => {
 export const getProjectById = async (req, res) => {
   try {
     const userId = getAuthenticatedUserId(req)
+    const { id } = req.params
 
     if (!userId) {
       return res.status(401).json({
@@ -331,8 +360,6 @@ export const getProjectById = async (req, res) => {
         message: 'Authentication required.',
       })
     }
-
-    const { id } = req.params
 
     if (!mongoose.isValidObjectId(id)) {
       return res.status(400).json({
@@ -357,7 +384,6 @@ export const getProjectById = async (req, res) => {
       success: true,
       project,
     })
-
   } catch (error) {
     console.error('Get single project error:', error)
 
@@ -381,7 +407,6 @@ export const getUsage = async (req, res) => {
     }
 
     const limit = getMonthlyLimit()
-
     const used = await getMonthlyProjectCount(userId)
 
     return res.status(200).json({
@@ -391,7 +416,6 @@ export const getUsage = async (req, res) => {
       remaining: Math.max(0, limit - used),
       plan: 'free',
     })
-
   } catch (error) {
     console.error('Get usage error:', error)
 
@@ -406,6 +430,7 @@ export const getUsage = async (req, res) => {
 export const deleteProject = async (req, res) => {
   try {
     const userId = getAuthenticatedUserId(req)
+    const { id } = req.params
 
     if (!userId) {
       return res.status(401).json({
@@ -413,8 +438,6 @@ export const deleteProject = async (req, res) => {
         message: 'Authentication required.',
       })
     }
-
-    const { id } = req.params
 
     if (!mongoose.isValidObjectId(id)) {
       return res.status(400).json({
@@ -443,7 +466,6 @@ export const deleteProject = async (req, res) => {
       deleteCloudinaryImage(
         project.originalImage?.publicId
       ),
-
       deleteCloudinaryImage(
         project.processedImage?.publicId
       ),
@@ -453,7 +475,6 @@ export const deleteProject = async (req, res) => {
       success: true,
       message: 'Project deleted successfully.',
     })
-
   } catch (error) {
     console.error('Delete project error:', error)
 
